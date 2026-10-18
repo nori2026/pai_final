@@ -56,7 +56,7 @@
     <include>
       <name>person</name>
       <pose>3.5 0.8 0 0 0 -1.57</pose>
-      <uri>https://fuel.gazebosim.org/1.0/OpenRobotics/models/Standing person</uri>
+      <uri>model://person_standing</uri>
       <static>true</static>
     </include>
 
