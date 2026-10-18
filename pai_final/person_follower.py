@@ -19,7 +19,7 @@ import numpy as np
 import cv2
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import Twist
 from std_msgs.msg import String
@@ -40,6 +40,8 @@ class PersonFollower(Node):
         self.declare_parameter('search_angular', 0.4)        # 人を見失った時の探索回転速度
         self.declare_parameter('lost_timeout', 1.0)          # この秒数見えなければ探索モード
         self.declare_parameter('show_window', False)         # OpenCVウィンドウ表示
+        self.declare_parameter('safe_ratio', 0.80)           # (改良) 人の高さ/画像高さ がこれ以上なら前進しない
+        self.declare_parameter('deadband', 0.05)             # (改良) このくらいのずれは無視する (ブルブル防止)
 
         p = lambda n: self.get_parameter(n).value
         self.conf = p('conf')
@@ -51,6 +53,8 @@ class PersonFollower(Node):
         self.search_ang = p('search_angular')
         self.lost_timeout = p('lost_timeout')
         self.show_window = p('show_window')
+        self.safe_ratio = p('safe_ratio')
+        self.deadband = p('deadband')
 
         # ---- AIモデルの読み込み (初回はインターネットから自動ダウンロード) ----
         from ultralytics import YOLO
@@ -62,12 +66,20 @@ class PersonFollower(Node):
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.debug_pub = self.create_publisher(Image, '/ai/debug_image', 10)
         self.state_pub = self.create_publisher(String, '/ai/state', 10)
+        # (改良) 古い画像をためない: 保持するのは最新の1枚だけ
+        qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                         history=HistoryPolicy.KEEP_LAST, depth=1)
         self.sub = self.create_subscription(
-            Image, '/camera/image_raw', self.image_callback, qos_profile_sensor_data)
+            Image, '/camera/image_raw', self.image_callback, qos)
 
-        self.last_seen = 0.0
+        self.last_seen = time.time()   # (改良) 起動直後にいきなり探索しない
         self.last_error = 0.0   # 最後に見えた方向 (探索時にそちらへ回る)
         self.busy = False
+        # (改良) レポート用の計測
+        self.prev_state = None
+        self.state_count = {}
+        self.infer_ms = 0.0
+        self.last_log = time.time()
 
     # ------------------------------------------------------------------
     # ROS の Image メッセージ <-> numpy 配列 の変換
@@ -109,7 +121,10 @@ class PersonFollower(Node):
             h, w = frame.shape[:2]
 
             # ---- AI 推論: class 0 = person だけを検出 ----
+            t0 = time.time()
             results = self.model(frame, classes=[0], conf=self.conf, verbose=False)
+            ms = (time.time() - t0) * 1000.0   # (改良) 推論にかかった時間[ms]
+            self.infer_ms = ms if self.infer_ms == 0.0 else 0.9 * self.infer_ms + 0.1 * ms
             boxes = results[0].boxes
 
             cmd = Twist()
@@ -127,13 +142,20 @@ class PersonFollower(Node):
                 height_ratio = (y2 - y1) / h               # 人の大きさ = 距離の目安
 
                 # 旋回: 人が右にいれば右へ (ROSでは angular.z が負 = 右回り)
-                cmd.angular.z = float(np.clip(-self.k_ang * error_x,
-                                              -self.max_ang, self.max_ang))
+                ang = -self.k_ang * error_x
+                if abs(error_x) < self.deadband:       # (改良) 小さなずれは無視
+                    ang = 0.0
+                cmd.angular.z = float(np.clip(ang, -self.max_ang, self.max_ang))
                 # 前進: 人が小さく(遠く)映っていれば進む。近すぎたら少し下がる
                 dist_error = self.target_h - height_ratio
                 lin = self.k_lin * dist_error
                 if abs(error_x) > 0.5:      # 大きくずれている時は旋回を優先
                     lin *= 0.3
+                if abs(dist_error) < self.deadband:    # (改良) ちょうど良い距離なら動かない
+                    lin = 0.0
+                safe_stop = height_ratio > self.safe_ratio   # (改良) 近すぎたら下がらず止まる
+                if safe_stop:
+                    lin = 0.0
                 cmd.linear.x = float(np.clip(lin, -0.15, self.max_lin))
 
                 self.last_seen = now
@@ -141,6 +163,8 @@ class PersonFollower(Node):
                 state = 'FOLLOW'
                 if abs(dist_error) < 0.05 and abs(error_x) < 0.1:
                     state = 'REACHED'
+                if safe_stop:
+                    state = 'SAFE_STOP'
 
                 # 動画用: 検出結果を描画
                 cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
@@ -155,13 +179,23 @@ class PersonFollower(Node):
             else:
                 state = 'WAIT'   # 一瞬見えなかっただけ → 停止して待つ
 
+            # (改良) 状態が変わったらログ / 5秒ごとに推論速度をログ (レポートの数値に使える)
+            if state != self.prev_state:
+                self.state_count[state] = self.state_count.get(state, 0) + 1
+                self.get_logger().info(f'状態 {self.prev_state} -> {state}  累計 {self.state_count}')
+                self.prev_state = state
+            if now - self.last_log > 5.0:
+                self.get_logger().info(f'推論 {self.infer_ms:.0f} ms/枚 (約 {1000.0 / max(self.infer_ms, 1e-3):.1f} fps)')
+                self.last_log = now
+
             self.cmd_pub.publish(cmd)
             self.state_pub.publish(String(data=state))
 
             # 画面中央線と状態表示
             cv2.line(frame, (w // 2, 0), (w // 2, h), (255, 255, 255), 1)
             color = {'FOLLOW': (0, 200, 0), 'REACHED': (255, 120, 0),
-                     'SEARCH': (0, 0, 255), 'WAIT': (0, 200, 200)}[state]
+                     'SEARCH': (0, 0, 255), 'WAIT': (0, 200, 200),
+                     'SAFE_STOP': (0, 120, 255)}[state]
             cv2.putText(frame, f'STATE: {state}', (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
             cv2.putText(frame, f'v={cmd.linear.x:+.2f} m/s  w={cmd.angular.z:+.2f} rad/s',
