@@ -42,6 +42,7 @@ class PersonFollower(Node):
         self.declare_parameter('show_window', False)         # OpenCVウィンドウ表示
         self.declare_parameter('safe_ratio', 0.80)           # (改良) 人の高さ/画像高さ がこれ以上なら前進しない
         self.declare_parameter('deadband', 0.05)             # (改良) このくらいのずれは無視する (ブルブル防止)
+        self.declare_parameter('hysteresis', 0.05)           # (改良2) 状態に入る/出るしきい値の差 (バタつき防止)
 
         p = lambda n: self.get_parameter(n).value
         self.conf = p('conf')
@@ -55,6 +56,7 @@ class PersonFollower(Node):
         self.show_window = p('show_window')
         self.safe_ratio = p('safe_ratio')
         self.deadband = p('deadband')
+        self.hysteresis = p('hysteresis')
 
         # ---- AIモデルの読み込み (初回はインターネットから自動ダウンロード) ----
         from ultralytics import YOLO
@@ -77,6 +79,8 @@ class PersonFollower(Node):
         self.busy = False
         # (改良) レポート用の計測
         self.prev_state = None
+        self.safe_active = False      # (改良2) SAFE_STOP 中かどうか
+        self.reached_active = False   # (改良2) REACHED 中かどうか
         self.state_count = {}
         self.infer_ms = 0.0
         self.last_log = time.time()
@@ -151,9 +155,16 @@ class PersonFollower(Node):
                 lin = self.k_lin * dist_error
                 if abs(error_x) > 0.5:      # 大きくずれている時は旋回を優先
                     lin *= 0.3
-                if abs(dist_error) < self.deadband:    # (改良) ちょうど良い距離なら動かない
+                # (改良2) ヒステリシス: REACHED中は「止まる範囲」を1.6倍に広げ、境目でのバタつきを防ぐ
+                scale = 1.6 if self.reached_active else 1.0
+                if abs(dist_error) < self.deadband * scale:    # (改良) ちょうど良い距離なら動かない
                     lin = 0.0
-                safe_stop = height_ratio > self.safe_ratio   # (改良) 近すぎたら下がらず止まる
+                # (改良2) SAFE_STOP は「入るしきい値」と「出るしきい値」を分ける
+                if self.safe_active:
+                    self.safe_active = height_ratio > self.safe_ratio - self.hysteresis
+                else:
+                    self.safe_active = height_ratio > self.safe_ratio
+                safe_stop = self.safe_active   # (改良) 近すぎたら下がらず止まる
                 if safe_stop:
                     lin = 0.0
                 cmd.linear.x = float(np.clip(lin, -0.15, self.max_lin))
@@ -161,7 +172,9 @@ class PersonFollower(Node):
                 self.last_seen = now
                 self.last_error = error_x
                 state = 'FOLLOW'
-                if abs(dist_error) < 0.05 and abs(error_x) < 0.1:
+                self.reached_active = (abs(dist_error) < self.deadband * scale
+                                       and abs(error_x) < 0.1 * scale)
+                if self.reached_active:
                     state = 'REACHED'
                 if safe_stop:
                     state = 'SAFE_STOP'
@@ -176,8 +189,10 @@ class PersonFollower(Node):
                 direction = -1.0 if self.last_error > 0 else 1.0
                 cmd.angular.z = direction * self.search_ang
                 state = 'SEARCH'
+                self.safe_active = self.reached_active = False
             else:
                 state = 'WAIT'   # 一瞬見えなかっただけ → 停止して待つ
+                self.safe_active = self.reached_active = False
 
             # (改良) 状態が変わったらログ / 5秒ごとに推論速度をログ (レポートの数値に使える)
             if state != self.prev_state:
