@@ -18,7 +18,7 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='your_omnicampus_name',
+    maintainer='norihousou',
     maintainer_email='noreply@example.com',
     description='PAI final assignment: YOLO person-following diff-drive robot in Gazebo',
     license='Apache-2.0',

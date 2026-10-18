@@ -4,7 +4,7 @@
   <name>pai_final</name>
   <version>0.1.0</version>
   <description>PAI final assignment: YOLO person-following diff-drive robot in Gazebo</description>
-  <maintainer email="noreply@example.com">your_omnicampus_name</maintainer>
+  <maintainer email="noreply@example.com">norihousou</maintainer>
   <license>Apache-2.0</license>
 
   <exec_depend>rclpy</exec_depend>
